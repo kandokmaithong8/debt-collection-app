@@ -346,6 +346,15 @@ monthly = generate_monthly_series()
 # UI
 # ========================================================================
 st.title("Debt Collection Decision Support")
+
+col_refresh1, col_refresh2 = st.columns([1,3])
+with col_refresh1:
+    if st.button("🔄 Refresh Portfolio", use_container_width=True):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.rerun()
+with col_refresh2:
+    st.caption("Reload portfolio data and recalculate all models")
 st.caption("Rule extraction → prediction → multi-criteria optimization, with evaluation metrics for every model.")
 
 tabs = st.tabs([
