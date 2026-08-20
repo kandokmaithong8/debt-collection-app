@@ -778,12 +778,27 @@ with tabs[5]:
 
     # ---- headline metrics ----
     eom_pred = predicted_path.iloc[-1]
+    eom_actual = actual_path.iloc[-1]
     cured_total = this_month_total - eom_pred["total"]
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Predicted remaining at EOM", f"{int(eom_pred['total']):,}")
-    c2.metric("Predicted cured by EOM", f"{int(cured_total):,}", f"{cured_total/this_month_total:.1%}")
-    c3.metric("↳ Normal remaining", f"{int(eom_pred['Normal']):,}")
-    c4.metric("↳ OD remaining", f"{int(eom_pred['OD']):,}")
+    pred_pct_remaining = eom_pred["total"] / this_month_total
+    actual_pct_remaining = eom_actual["total"] / prior_month_total
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Predicted remaining at EOM (this month)", f"{int(eom_pred['total']):,}",
+              f"{pred_pct_remaining:.1%} of starting volume")
+    c2.metric("Actual remaining at EOM (last month)", f"{int(eom_actual['total']):,}",
+              f"{actual_pct_remaining:.1%} of starting volume")
+    c3.metric("Predicted cured by EOM", f"{int(cured_total):,}", f"{cured_total/this_month_total:.1%}")
+    c4, c5 = st.columns(2)
+    c4.metric("↳ Normal remaining at EOM (predicted)", f"{int(eom_pred['Normal']):,}")
+    c5.metric("↳ OD remaining at EOM (predicted)", f"{int(eom_pred['OD']):,}")
+    explain(f"""
+    Last month started with <b>{prior_month_total:,}</b> accounts and this month started with
+    <b>{this_month_total:,}</b> — since the starting volumes differ, compare the <b>% of starting
+    volume remaining</b> shown under each metric above, not the raw counts, for an apples-to-apples
+    read. Predicted leaves <b>{pred_pct_remaining:.1%}</b> of accounts still in debt at EOM vs.
+    <b>{actual_pct_remaining:.1%}</b> actually realized last month.
+    """)
 
     # ---- chart: actual (last month) vs predicted (this month) ----
     st.markdown("#### Remaining debt accounts by checkpoint — last month (actual) vs. this month (predicted)")
@@ -816,8 +831,33 @@ with tabs[5]:
     deplete in four smaller steps.
     """)
 
-    with st.expander("Full checkpoint breakdown (predicted, this month)"):
-        st.dataframe(predicted_path.set_index("checkpoint").round(0).astype(int), use_container_width=True)
+    st.markdown("#### Checkpoint breakdown — actual (last month) vs. predicted (this month)")
+    merged = actual_path.merge(predicted_path, on="checkpoint", suffixes=(" · Actual", " · Predicted"))
+    merged = merged.rename(columns={"checkpoint": "Checkpoint"})[[
+        "Checkpoint", "total · Actual", "total · Predicted",
+        "Normal · Actual", "Normal · Predicted",
+        "OD · Actual", "OD · Predicted",
+        "TDR · Actual", "TDR · Predicted",
+    ]].rename(columns={
+        "total · Actual": "Total (Actual)", "total · Predicted": "Total (Predicted)",
+        "Normal · Actual": "Normal (Actual)", "Normal · Predicted": "Normal (Predicted)",
+        "OD · Actual": "OD (Actual)", "OD · Predicted": "OD (Predicted)",
+        "TDR · Actual": "TDR (Actual)", "TDR · Predicted": "TDR (Predicted)",
+    })
+    for c in merged.columns[1:]:
+        merged[c] = merged[c].round(0).astype(int)
+
+    def _highlight_eom(row):
+        is_eom = row.name == "Day 20 (EOM)"
+        return ["background-color: #FBF7EC; font-weight: 600" if is_eom else "" for _ in row]
+
+    st.dataframe(merged.set_index("Checkpoint").style.apply(_highlight_eom, axis=1), use_container_width=True)
+    explain("""
+    The highlighted <b>Day 20 (EOM)</b> row is the end-of-month result — the number that matters
+    most for reporting. Compare its Actual and Predicted columns directly: if Predicted is
+    consistently higher than Actual, this month's cure-rate assumptions may be too pessimistic
+    (or vice versa), which is a good signal to revisit the sliders above.
+    """)
 
     # ---- evaluation ----
     st.markdown("#### Forecast evaluation")
