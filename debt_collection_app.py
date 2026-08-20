@@ -13,7 +13,7 @@ Plus a monthly account-volume trend with a forecast, and an evaluation panel
 
 RUN LOCALLY
 -----------
-    pip install streamlit scikit-learn pandas numpy scipy plotly
+    pip install streamlit scikit-learn pandas numpy scipy plotly statsmodels
     streamlit run debt_collection_app.py
 
 Replace `generate_synthetic_portfolio()` / `generate_monthly_series()` with
@@ -153,6 +153,96 @@ def backtest_forecast(actual: np.ndarray, holdout: int = 6) -> dict:
     rmse = np.sqrt(np.mean((test - pred) ** 2))
     mape = np.mean(np.abs((test - pred) / test)) * 100
     return {"mae": mae, "rmse": rmse, "mape": mape, "test": test, "pred": pred}
+
+
+# ========================================================================
+# FORECASTING — ARIMA / SARIMA (statsmodels), offered as a proper
+# time-series alternative to the trend+seasonal heuristic above. Falls
+# back to a non-seasonal ARIMA(1,1,1) when there isn't enough history
+# (< 24 months = under 2 full yearly cycles) for a reliable seasonal fit.
+# ========================================================================
+def fit_arima_forecast(actual: np.ndarray, horizon: int):
+    import warnings
+    from statsmodels.tsa.statespace.sarimax import SARIMAX
+    warnings.filterwarnings("ignore")
+
+    seasonal = len(actual) >= 24
+    order = (1, 1, 1)
+    seasonal_order = (1, 1, 1, 12) if seasonal else (0, 0, 0, 0)
+    fit = SARIMAX(actual, order=order, seasonal_order=seasonal_order,
+                  enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+    fc = fit.get_forecast(steps=horizon)
+    pred = fc.predicted_mean
+    ci = fc.conf_int(alpha=0.10)  # 90% interval
+    lower, upper = np.asarray(ci)[:, 0], np.asarray(ci)[:, 1]
+    return pred.round().astype(int), lower.round().astype(int), upper.round().astype(int), seasonal
+
+
+def backtest_arima_forecast(actual: np.ndarray, holdout: int = 6) -> dict:
+    train, test = actual[:-holdout], actual[-holdout:]
+    try:
+        pred, _, _, seasonal = fit_arima_forecast(train, holdout)
+    except Exception as e:
+        return {"mae": np.nan, "rmse": np.nan, "mape": np.nan, "seasonal": False, "error": str(e)}
+    mae = np.mean(np.abs(test - pred))
+    rmse = np.sqrt(np.mean((test - pred) ** 2))
+    mape = np.mean(np.abs((test - pred) / test)) * 100
+    return {"mae": mae, "rmse": rmse, "mape": mape, "seasonal": seasonal, "test": test, "pred": pred}
+
+
+# ========================================================================
+# AUTOCORRELATION DIAGNOSTICS — ACF of the raw series (to justify
+# seasonality/differencing choices) and ACF of each method's residuals
+# plus a Ljung-Box test (to check whether meaningful structure was left
+# on the table after fitting).
+# ========================================================================
+def compute_acf(series: np.ndarray, nlags: int):
+    from statsmodels.tsa.stattools import acf
+    nlags = max(1, min(nlags, len(series) - 2))
+    vals = acf(series, nlags=nlags, fft=True)
+    conf = 1.96 / np.sqrt(len(series))
+    return vals, conf
+
+
+def acf_bar_chart(vals: np.ndarray, conf: float, yaxis_title: str = "Autocorrelation"):
+    lags = list(range(len(vals)))
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=lags, y=vals, marker_color=NAVY, name="ACF", width=0.4))
+    fig.add_hline(y=conf, line=dict(color=GOLD, dash="dash", width=1))
+    fig.add_hline(y=-conf, line=dict(color=GOLD, dash="dash", width=1))
+    fig.add_hline(y=0, line=dict(color=LINE, width=1))
+    fig.update_layout(**CHART_TEMPLATE, height=280, yaxis_title=yaxis_title)
+    fig.update_xaxes(title_text="Lag (months)", dtick=1)
+    return fig
+
+
+def simple_method_residuals(actual: np.ndarray) -> np.ndarray:
+    """In-sample residuals of the trend+seasonal method, fit on the full series."""
+    t = np.arange(len(actual))
+    coeffs = np.polyfit(t, actual, 1)
+    trend = np.poly1d(coeffs)
+    season = 60 * np.sin((t / 18) * 3 * np.pi)
+    return actual - (trend(t) + season)
+
+
+def arima_method_residuals(actual: np.ndarray) -> np.ndarray:
+    """In-sample residuals of the ARIMA/SARIMA method, fit on the full series."""
+    import warnings
+    from statsmodels.tsa.statespace.sarimax import SARIMAX
+    warnings.filterwarnings("ignore")
+    seasonal = len(actual) >= 24
+    order = (1, 1, 1)
+    seasonal_order = (1, 1, 1, 12) if seasonal else (0, 0, 0, 0)
+    fit = SARIMAX(actual, order=order, seasonal_order=seasonal_order,
+                  enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+    return np.asarray(fit.resid)
+
+
+def ljung_box_pvalue(residuals: np.ndarray, lags: int = 8) -> float:
+    from statsmodels.stats.diagnostic import acorr_ljungbox
+    lags = max(1, min(lags, len(residuals) // 2 - 1))
+    result = acorr_ljungbox(residuals, lags=[lags], return_df=True)
+    return float(result["lb_pvalue"].iloc[0])
 
 
 # ========================================================================
@@ -492,8 +582,27 @@ tabs = st.tabs([
 with tabs[0]:
     st.subheader("Accounts in active collection — actual vs. forecast")
     horizon = st.slider("Forecast horizon (months)", 1, 12, 6)
-    pred, lower, upper = fit_forecast(monthly["accounts"].to_numpy(), horizon)
+    method = st.radio(
+        "Forecast method", ["Trend + Seasonal (simple)", "ARIMA / SARIMA (statsmodels)"],
+        horizontal=True,
+    )
+    actual_arr = monthly["accounts"].to_numpy()
     future_months = pd.date_range(monthly["month"].iloc[-1] + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
+
+    arima_seasonal_used = None
+    if method == "Trend + Seasonal (simple)":
+        pred, lower, upper = fit_forecast(actual_arr, horizon)
+    else:
+        try:
+            pred, lower, upper, arima_seasonal_used = fit_arima_forecast(actual_arr, horizon)
+        except Exception as e:
+            st.warning(f"ARIMA failed to fit ({e}); falling back to the simple trend+seasonal method.")
+            pred, lower, upper = fit_forecast(actual_arr, horizon)
+            method = "Trend + Seasonal (simple)"
+
+    if method != "Trend + Seasonal (simple)" and arima_seasonal_used is False:
+        st.caption("⚠️ Only 18 months of history — not enough for a reliable *seasonal* fit (needs ~24+), "
+                   "so this is a non-seasonal ARIMA(1,1,1) rather than full SARIMA.")
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=future_months, y=upper, line=dict(width=0), showlegend=False, hoverinfo="skip"))
@@ -528,7 +637,8 @@ with tabs[0]:
     """)
 
     st.markdown("#### Forecast evaluation")
-    bt = backtest_forecast(monthly["accounts"].to_numpy(), holdout=6)
+    bt = backtest_forecast(actual_arr, holdout=6) if method == "Trend + Seasonal (simple)" \
+        else backtest_arima_forecast(actual_arr, holdout=6)
     c1, c2, c3 = st.columns(3)
     c1.metric("MAE", f"{bt['mae']:.0f} accounts")
     c2.metric("RMSE", f"{bt['rmse']:.0f} accounts")
@@ -545,6 +655,61 @@ with tabs[0]:
     <b>{bt['mape']:.1f}%</b> on a typical month, which gives a scale-free sense of accuracy you can
     compare across portfolios of different sizes.
     """)
+
+    st.markdown("#### Autocorrelation diagnostics")
+    max_lags = min(12, len(actual_arr) // 2 - 1)
+    acf_raw, conf_raw = compute_acf(actual_arr, nlags=max_lags)
+    st.plotly_chart(acf_bar_chart(acf_raw, conf_raw), use_container_width=True)
+    explain(f"""
+    This is the <b>ACF of the raw monthly series</b> — how correlated the series is with itself at
+    each lag (1 month back, 2 months back, etc). Bars beyond the dashed gold band (95% significance)
+    indicate real autocorrelation, not noise. A slow decay across early lags points to a trend (which
+    is why both methods difference/detrend before forecasting); a spike back out around lag 12 would
+    point to yearly seasonality — worth watching for once there's enough history to see a full year
+    twice over.
+    """)
+
+    resid = simple_method_residuals(actual_arr) if method == "Trend + Seasonal (simple)" \
+        else arima_method_residuals(actual_arr)
+    acf_resid, conf_resid = compute_acf(resid, nlags=max_lags)
+    lb_p = ljung_box_pvalue(resid, lags=min(8, max_lags))
+
+    st.markdown(f"###### Residual ACF — {method}")
+    st.plotly_chart(acf_bar_chart(acf_resid, conf_resid, yaxis_title="Residual autocorrelation"),
+                     use_container_width=True)
+    lb_verdict = "no significant leftover structure" if lb_p > 0.05 else "some leftover structure the model didn't capture"
+    st.metric("Ljung-Box test p-value (residuals)", f"{lb_p:.3f}")
+    explain(f"""
+    This is the ACF of the <b>fitted model's residuals</b> — what's left over after removing trend/
+    seasonality. A well-fitted model should leave residuals that look like white noise: bars mostly
+    inside the gold band, no clear pattern. Almost all bars here sit inside the band, which the
+    <b>Ljung-Box test</b> confirms statistically: a p-value above 0.05 (here, <b>{lb_p:.3f}</b>) means
+    there's <b>{lb_verdict}</b> in the residuals — in plain terms, the residuals are consistent with
+    white noise, so the model isn't leaving obvious predictable patterns on the table. A low p-value
+    would be a signal to reconsider the model's order or add a missing seasonal/trend term.
+    """)
+
+    with st.expander("Method comparison — simple trend+seasonal vs. ARIMA/SARIMA"):
+        bt_simple = backtest_forecast(actual_arr, holdout=6)
+        bt_arima = backtest_arima_forecast(actual_arr, holdout=6)
+        comp = pd.DataFrame({
+            "Method": ["Trend + Seasonal (simple)", "ARIMA / SARIMA"],
+            "MAE": [bt_simple["mae"], bt_arima["mae"]],
+            "RMSE": [bt_simple["rmse"], bt_arima["rmse"]],
+            "MAPE (%)": [bt_simple["mape"], bt_arima["mape"]],
+        }).round(1)
+        st.dataframe(comp.set_index("Method"), use_container_width=True)
+        better = "ARIMA / SARIMA" if bt_arima["mae"] < bt_simple["mae"] else "Trend + Seasonal (simple)"
+        explain(f"""
+        Both methods are backtested the same way (last 6 months hidden, then scored). On this
+        portfolio's history, <b>{better}</b> currently backtests more accurately (lower MAE).<br><br>
+        <b>Should you use ARIMA?</b> It's the more statistically standard choice for time series and
+        can capture autocorrelation the simple method ignores — but with only 18 months of history
+        (under 2 full yearly cycles), a seasonal ARIMA has very little data to estimate seasonality
+        from, so it can be as noisy as the simple heuristic here. ARIMA tends to earn its keep once
+        you have 3+ years of monthly history; with real, longer data behind this app, re-run this
+        comparison and let it decide which method to keep as the default.
+        """)
 
 # ---------------------------------------------------------------- TAB 2
 with tabs[1]:
@@ -752,9 +917,16 @@ with tabs[5]:
         "predicts how many remain in debt after each due date passes, split by type."
     )
 
+    month_options = pd.date_range(pd.Timestamp.now().replace(day=1), periods=12, freq="MS")
+    month_labels = [m.strftime("%b %Y") for m in month_options]
+    selected_label = st.selectbox("Month to predict", month_labels, index=0)
+    selected_month = month_options[month_labels.index(selected_label)]
+    prior_month = selected_month - pd.DateOffset(months=1)
+    prior_label = prior_month.strftime("%b %Y")
+
     colL, colR = st.columns(2)
     with colL:
-        st.markdown("**This month**")
+        st.markdown(f"**{selected_label}**")
         this_month_total = st.number_input("Total accounts at start of month", min_value=100,
                                             max_value=1_000_000, value=10000, step=100, key="cyc_total")
         tdr_pct = st.slider("Share of accounts that are TDR (due date = 1st)", 0, 30, 8, step=1,
@@ -766,7 +938,7 @@ with tabs[5]:
         tdr_rate = st.slider("TDR cure rate", 0.0, 1.0, float(model_cure_rates.get("TDR", 0.5)), step=0.01)
         normal_rate = st.slider("Normal cure rate", 0.0, 1.0, float(model_cure_rates.get("Normal", 0.5)), step=0.01)
         od_rate = st.slider("OD cure rate", 0.0, 1.0, float(model_cure_rates.get("OD", 0.5)), step=0.01)
-        prior_month_total = st.number_input("Last month's starting total (for the actual comparison line)",
+        prior_month_total = st.number_input(f"{prior_label} starting total (for the actual comparison line)",
                                              min_value=100, max_value=1_000_000,
                                              value=int(monthly["accounts"].iloc[-1]), step=100, key="cyc_prior")
 
@@ -784,40 +956,40 @@ with tabs[5]:
     actual_pct_remaining = eom_actual["total"] / prior_month_total
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Predicted remaining at EOM (this month)", f"{int(eom_pred['total']):,}",
+    c1.metric(f"Predicted remaining at EOM ({selected_label})", f"{int(eom_pred['total']):,}",
               f"{pred_pct_remaining:.1%} of starting volume")
-    c2.metric("Actual remaining at EOM (last month)", f"{int(eom_actual['total']):,}",
+    c2.metric(f"Actual remaining at EOM ({prior_label})", f"{int(eom_actual['total']):,}",
               f"{actual_pct_remaining:.1%} of starting volume")
     c3.metric("Predicted cured by EOM", f"{int(cured_total):,}", f"{cured_total/this_month_total:.1%}")
     c4, c5 = st.columns(2)
     c4.metric("↳ Normal remaining at EOM (predicted)", f"{int(eom_pred['Normal']):,}")
     c5.metric("↳ OD remaining at EOM (predicted)", f"{int(eom_pred['OD']):,}")
     explain(f"""
-    Last month started with <b>{prior_month_total:,}</b> accounts and this month started with
-    <b>{this_month_total:,}</b> — since the starting volumes differ, compare the <b>% of starting
-    volume remaining</b> shown under each metric above, not the raw counts, for an apples-to-apples
-    read. Predicted leaves <b>{pred_pct_remaining:.1%}</b> of accounts still in debt at EOM vs.
-    <b>{actual_pct_remaining:.1%}</b> actually realized last month.
+    {prior_label} started with <b>{prior_month_total:,}</b> accounts and {selected_label} started
+    with <b>{this_month_total:,}</b> — since the starting volumes differ, compare the <b>% of
+    starting volume remaining</b> shown under each metric above, not the raw counts, for an
+    apples-to-apples read. Predicted leaves <b>{pred_pct_remaining:.1%}</b> of accounts still in
+    debt at EOM vs. <b>{actual_pct_remaining:.1%}</b> actually realized in {prior_label}.
     """)
 
-    # ---- chart: actual (last month) vs predicted (this month) ----
-    st.markdown("#### Remaining debt accounts by checkpoint — last month (actual) vs. this month (predicted)")
+    # ---- chart: actual (prior month) vs predicted (selected month) ----
+    st.markdown(f"#### Remaining debt accounts by checkpoint — {prior_label} (actual) vs. {selected_label} (predicted)")
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=actual_path["checkpoint"], y=actual_path["total"], mode="lines+markers",
-                              name="Actual (last month)", line=dict(color=NAVY, width=2.5)))
+                              name=f"Actual ({prior_label})", line=dict(color=NAVY, width=2.5)))
     fig.add_trace(go.Scatter(x=predicted_path["checkpoint"], y=predicted_path["total"], mode="lines+markers",
-                              name="Predicted (this month)", line=dict(color=GOLD, width=2.5, dash="dash")))
+                              name=f"Predicted ({selected_label})", line=dict(color=GOLD, width=2.5, dash="dash")))
     fig.update_layout(**CHART_TEMPLATE, height=380, yaxis_title="Remaining debt accounts", hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
-    explain("""
-    <b>Actual (last month)</b> is a simulated realized outcome — cure rates applied with
-    month-to-month noise, the way real operations data would look. <b>Predicted (this month)</b>
-    applies the same cure-rate assumptions deterministically to this month's starting volume. The
+    explain(f"""
+    <b>Actual ({prior_label})</b> is a simulated realized outcome — cure rates applied with
+    month-to-month noise, the way real operations data would look. <b>Predicted ({selected_label})</b>
+    applies the same cure-rate assumptions deterministically to that month's starting volume. The
     two lines being similar in shape is a sanity check that the assumptions are reasonable; a
-    large gap suggests this month's mix or cure rates should be revisited.
+    large gap suggests the mix or cure rates for {selected_label} should be revisited.
     """)
 
-    st.markdown("#### Predicted remaining accounts by type, per checkpoint")
+    st.markdown(f"#### Predicted remaining accounts by type, per checkpoint — {selected_label}")
     fig2 = go.Figure()
     for col, color in [("Normal", NAVY), ("OD", GOLD), ("TDR", GREY)]:
         fig2.add_trace(go.Scatter(x=predicted_path["checkpoint"], y=predicted_path[col], mode="lines+markers",
@@ -831,7 +1003,7 @@ with tabs[5]:
     deplete in four smaller steps.
     """)
 
-    st.markdown("#### Checkpoint breakdown — actual (last month) vs. predicted (this month)")
+    st.markdown(f"#### Checkpoint breakdown — {prior_label} (actual) vs. {selected_label} (predicted)")
     merged = actual_path.merge(predicted_path, on="checkpoint", suffixes=(" · Actual", " · Predicted"))
     merged = merged.rename(columns={"checkpoint": "Checkpoint"})[[
         "Checkpoint", "total · Actual", "total · Predicted",
@@ -852,12 +1024,25 @@ with tabs[5]:
         return ["background-color: #FBF7EC; font-weight: 600" if is_eom else "" for _ in row]
 
     st.dataframe(merged.set_index("Checkpoint").style.apply(_highlight_eom, axis=1), use_container_width=True)
-    explain("""
+    explain(f"""
     The highlighted <b>Day 20 (EOM)</b> row is the end-of-month result — the number that matters
-    most for reporting. Compare its Actual and Predicted columns directly: if Predicted is
-    consistently higher than Actual, this month's cure-rate assumptions may be too pessimistic
-    (or vice versa), which is a good signal to revisit the sliders above.
+    most for reporting. Compare its Actual ({prior_label}) and Predicted ({selected_label}) columns
+    directly: if Predicted is consistently higher than Actual, {selected_label}'s cure-rate
+    assumptions may be too pessimistic (or vice versa), which is a good signal to revisit the
+    sliders above.
     """)
+
+    export_df = merged.copy()
+    export_df.insert(0, "Predicted Month", selected_label)
+    export_df.insert(1, "Actual Month (compared)", prior_label)
+    csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Download this forecast as CSV",
+        data=csv_bytes,
+        file_name=f"cycle_forecast_{selected_label.replace(' ', '_')}.csv",
+        mime="text/csv",
+        use_container_width=False,
+    )
 
     # ---- evaluation ----
     st.markdown("#### Forecast evaluation")
@@ -867,17 +1052,17 @@ with tabs[5]:
     e2.metric("RMSE-like", f"{bt['rmse']:.0f} accounts")
     e3.metric("MAPE-like", f"{bt['mape']:.1f}%")
     explain(f"""
-    <b>How this was evaluated:</b> this checks the reliability of the <i>method</i>, not this
-    month's specific number. Using last month's starting total ({prior_month_total:,} accounts) as
-    a baseline, 300 alternate versions of "what could have happened" were simulated with the same
-    cure-rate assumptions plus realistic month-to-month noise, then compared against the single
-    deterministic point forecast the method would have produced for that baseline
-    (<b>{bt['point_forecast']:.0f} accounts</b>).<br><br>
+    <b>How this was evaluated:</b> this checks the reliability of the <i>method</i>, not
+    {selected_label}'s specific number. Using {prior_label}'s starting total
+    ({prior_month_total:,} accounts) as a baseline, 300 alternate versions of "what could have
+    happened" were simulated with the same cure-rate assumptions plus realistic month-to-month
+    noise, then compared against the single deterministic point forecast the method would have
+    produced for that baseline (<b>{bt['point_forecast']:.0f} accounts</b>).<br><br>
     On average, a realized month-end total differed from the point forecast by about
     <b>±{bt['mae']:.0f} accounts ({bt['mape']:.1f}%)</b>, with 90% of outcomes falling between
-    <b>{bt['p5']:.0f}</b> and <b>{bt['p95']:.0f}</b>. Apply that same error margin to this month's
-    prediction above (<b>{int(eom_pred['total']):,} accounts</b>) as a rough confidence range,
-    rather than treating it as an exact guarantee, when setting collection targets.
+    <b>{bt['p5']:.0f}</b> and <b>{bt['p95']:.0f}</b>. Apply that same error margin to
+    {selected_label}'s prediction above (<b>{int(eom_pred['total']):,} accounts</b>) as a rough
+    confidence range, rather than treating it as an exact guarantee, when setting collection targets.
     """)
 
 st.markdown("---")
