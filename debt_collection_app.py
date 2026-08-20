@@ -312,6 +312,129 @@ def cluster_and_route(df_field: pd.DataFrame, n_collectors: int = 3) -> pd.DataF
 
 
 # ========================================================================
+# "NEW INPUT" — monthly payment-cycle forecast
+#   Debtors are billed on one of five cycle days: 1, 5, 10, 15, 20.
+#     - Due date 1  -> exclusively TDR (restructured) accounts.
+#     - Due dates 5/10/15/20 -> Normal and OD accounts, mixed across all four.
+#   All accounts start the month already flagged as debt accounts. As each
+#   due date passes, a share of the accounts due that day "cure" (pay) and
+#   exit debt status; the rest remain debt accounts for the rest of the
+#   month. The forecast walks through checkpoints 1 -> 5 -> 10 -> 15 -> 20
+#   and predicts how many accounts are still in debt after each one,
+#   split by account type (TDR / Normal / OD).
+# ========================================================================
+CYCLE_DUE_DATES = [1, 5, 10, 15, 20]
+CYCLE_CHECKPOINT_LABELS = ["Start", "Day 1", "Day 5", "Day 10", "Day 15", "Day 20 (EOM)"]
+
+
+@st.cache_data
+def generate_cycle_sample(n: int = 4000, tdr_share: float = 0.08, od_share: float = 0.3) -> pd.DataFrame:
+    """Synthetic accounts tagged with a payment-cycle due date and an account
+    type, with feature distributions nudged per type so the existing Layer 2
+    model has something meaningful to score them on."""
+    rng = np.random.default_rng(RANDOM_STATE + 11)
+    n_tdr = int(n * tdr_share)
+    n_rest = n - n_tdr
+
+    due_date = np.concatenate([np.full(n_tdr, 1), rng.choice([5, 10, 15, 20], size=n_rest)])
+    account_type = np.concatenate([
+        np.full(n_tdr, "TDR", dtype=object),
+        rng.choice(["Normal", "OD"], size=n_rest, p=[1 - od_share, od_share]),
+    ])
+    is_tdr = account_type == "TDR"
+    is_od = account_type == "OD"
+
+    balance = np.where(is_tdr, rng.gamma(1.6, 11000, n),
+               np.where(is_od, rng.gamma(1.4, 9000, n), rng.gamma(2.0, 15000, n)))
+    dpd = np.where(is_tdr, rng.integers(30, 200, n), rng.integers(1, 120, n))
+    defaults = np.where(is_tdr, rng.poisson(1.8, n), rng.poisson(0.9, n))
+    attempted = rng.integers(0, 20, n)
+    successful = (attempted * rng.uniform(0.1, 0.7, n)).round().astype(int)
+    income = rng.normal(35000, 12000, n).clip(5000, None).round(2)
+    credit = rng.normal(620, 80, n).clip(300, 850).round(0)
+    partial = rng.choice([0, 1], n, p=[0.5, 0.5])
+
+    return pd.DataFrame({
+        "account_type": account_type, "due_date_cycle": due_date,
+        "outstanding_balance": balance.round(2), "days_past_due": dpd,
+        "num_prior_defaults": defaults, "num_contacts_attempted": attempted,
+        "num_successful_contacts": successful, "monthly_income": income,
+        "credit_score": credit, "prior_partial_payment": partial,
+    })
+
+
+def estimate_cure_rates(cycle_sample: pd.DataFrame, _model, _rule_tree, feature_cols: list) -> dict:
+    """Scores the cycle sample with the existing Layer 1 segment tree and
+    Layer 2 repayment model, then averages predicted probability by account
+    type to get a model-implied 'cure rate' assumption for each bucket."""
+    scored = cycle_sample.copy()
+    scored["segment"] = _rule_tree.predict(scored[feature_cols])
+    scored["cure_prob"] = _model.predict_proba(scored[feature_cols + ["segment"]])[:, 1]
+    return scored.groupby("account_type")["cure_prob"].mean().to_dict()
+
+
+def simulate_cycle_depletion(total_accounts: int, tdr_pct: float, od_pct: float,
+                              cure_rates: dict, noise: bool = False, rng=None) -> pd.DataFrame:
+    """Depletes `total_accounts` debt accounts checkpoint by checkpoint.
+    Returns one row per checkpoint (Start, Day1, Day5, Day10, Day15, Day20)
+    with remaining debt accounts for TDR / Normal / OD / total."""
+    if rng is None:
+        rng = np.random.default_rng(RANDOM_STATE + 99)
+
+    n_tdr = round(total_accounts * tdr_pct)
+    n_rest = total_accounts - n_tdr
+    n_od = round(n_rest * od_pct)
+    n_normal = n_rest - n_od
+
+    other_days = [5, 10, 15, 20]
+    due_today_count = {("TDR", 1): n_tdr}
+    base_normal, base_od = n_normal // len(other_days), n_od // len(other_days)
+    for i, d in enumerate(other_days):
+        due_today_count[("Normal", d)] = base_normal + (n_normal % len(other_days) if i == 0 else 0)
+        due_today_count[("OD", d)] = base_od + (n_od % len(other_days) if i == 0 else 0)
+
+    remaining = {"TDR": n_tdr, "Normal": n_normal, "OD": n_od}
+    rows = [{"checkpoint": "Start", "TDR": n_tdr, "Normal": n_normal, "OD": n_od, "total": total_accounts}]
+
+    for day in CYCLE_DUE_DATES:
+        for t in ["TDR", "Normal", "OD"]:
+            due_today = due_today_count.get((t, day), 0)
+            if due_today == 0:
+                continue
+            rate = float(np.clip(cure_rates.get(t, 0.5), 0, 1))
+            if noise:
+                realized_rate = float(np.clip(rate + rng.normal(0, 0.04), 0, 1))
+                cured = rng.binomial(due_today, realized_rate)
+            else:
+                cured = due_today * rate
+            remaining[t] = max(remaining[t] - cured, 0)
+        label = "Day 20 (EOM)" if day == 20 else f"Day {day}"
+        rows.append({"checkpoint": label, "TDR": remaining["TDR"], "Normal": remaining["Normal"],
+                     "OD": remaining["OD"], "total": remaining["TDR"] + remaining["Normal"] + remaining["OD"]})
+    return pd.DataFrame(rows)
+
+
+def backtest_cycle_forecast(tdr_pct: float, od_pct: float, cure_rates: dict,
+                             prior_total: int, n_sims: int = 300) -> dict:
+    """Evaluates the forecasting method itself: simulate a 'true' realized
+    outcome many times with cure-rate noise (representing month-to-month
+    variability actually observed in operations), and compare each realized
+    end-of-month total against the single deterministic point forecast."""
+    rng = np.random.default_rng(RANDOM_STATE + 7)
+    point_forecast = simulate_cycle_depletion(prior_total, tdr_pct, od_pct, cure_rates, noise=False).iloc[-1]["total"]
+    realized = np.array([
+        simulate_cycle_depletion(prior_total, tdr_pct, od_pct, cure_rates, noise=True, rng=rng).iloc[-1]["total"]
+        for _ in range(n_sims)
+    ])
+    mae = np.mean(np.abs(realized - point_forecast))
+    rmse = np.sqrt(np.mean((realized - point_forecast) ** 2))
+    mape = np.mean(np.abs((realized - point_forecast) / prior_total)) * 100
+    p5, p95 = np.percentile(realized, [5, 95])
+    return {"point_forecast": point_forecast, "mae": mae, "rmse": rmse, "mape": mape,
+            "p5": p5, "p95": p95, "realized": realized}
+
+
+# ========================================================================
 # BUILD PIPELINE (cached — recomputes only when inputs change)
 # ========================================================================
 FEATURE_COLS = ["outstanding_balance", "days_past_due", "num_prior_defaults",
@@ -341,6 +464,9 @@ ahp_w, ahp_cr = ahp_weights(pairwise)
 fuzzy_engine = FuzzyUrgencyEngine()
 monthly = generate_monthly_series()
 
+cycle_sample = generate_cycle_sample()
+model_cure_rates = estimate_cure_rates(cycle_sample, model, rule_tree, FEATURE_COLS)
+
 
 # ========================================================================
 # UI
@@ -359,7 +485,7 @@ st.caption("Rule extraction → prediction → multi-criteria optimization, with
 
 tabs = st.tabs([
     "📈 Monthly Trend", "🧩 Layer 1 · Rule Extraction", "🎯 Layer 2 · Prediction",
-    "⚖️ Layer 3 · Optimization", "🔍 Score a Debtor"
+    "⚖️ Layer 3 · Optimization", "🔍 Score a Debtor", "🆕 New Input · Cycle Forecast"
 ])
 
 # ---------------------------------------------------------------- TAB 1
@@ -598,6 +724,104 @@ with tabs[4]:
     fig.add_vline(x=proba, line=dict(color=GOLD, width=2, dash="dot"))
     fig.update_layout(**CHART_TEMPLATE, height=340, xaxis_title="Predicted probability", yaxis_title="Actual repayment rate")
     st.plotly_chart(fig, use_container_width=True)
+
+# ---------------------------------------------------------------- TAB 6
+with tabs[5]:
+    st.subheader("New Input — monthly payment-cycle forecast")
+    st.write(
+        "Debtors are billed on one of five cycle days: **1, 5, 10, 15, 20**. Due date **1 is "
+        "exclusively TDR** (restructured) accounts; due dates **5/10/15/20 are Normal and OD "
+        "accounts, mixed across all four**. All accounts start the month as debt accounts — this "
+        "predicts how many remain in debt after each due date passes, split by type."
+    )
+
+    colL, colR = st.columns(2)
+    with colL:
+        st.markdown("**This month**")
+        this_month_total = st.number_input("Total accounts at start of month", min_value=100,
+                                            max_value=1_000_000, value=10000, step=100, key="cyc_total")
+        tdr_pct = st.slider("Share of accounts that are TDR (due date = 1st)", 0, 30, 8, step=1,
+                             format="%d%%") / 100
+        od_pct = st.slider("Share of non-TDR accounts that are OD (rest = Normal)", 0, 100, 30, step=1,
+                            format="%d%%") / 100
+    with colR:
+        st.markdown("**Cure rate assumptions** *(model-estimated from Layer 1 + Layer 2, editable)*")
+        tdr_rate = st.slider("TDR cure rate", 0.0, 1.0, float(model_cure_rates.get("TDR", 0.5)), step=0.01)
+        normal_rate = st.slider("Normal cure rate", 0.0, 1.0, float(model_cure_rates.get("Normal", 0.5)), step=0.01)
+        od_rate = st.slider("OD cure rate", 0.0, 1.0, float(model_cure_rates.get("OD", 0.5)), step=0.01)
+        prior_month_total = st.number_input("Last month's starting total (for the actual comparison line)",
+                                             min_value=100, max_value=1_000_000,
+                                             value=int(monthly["accounts"].iloc[-1]), step=100, key="cyc_prior")
+
+    cure_rates = {"TDR": tdr_rate, "Normal": normal_rate, "OD": od_rate}
+    rng_actual = np.random.default_rng(RANDOM_STATE + 5)
+
+    predicted_path = simulate_cycle_depletion(this_month_total, tdr_pct, od_pct, cure_rates, noise=False)
+    actual_path = simulate_cycle_depletion(prior_month_total, tdr_pct, od_pct, cure_rates, noise=True, rng=rng_actual)
+
+    # ---- headline metrics ----
+    eom_pred = predicted_path.iloc[-1]
+    cured_total = this_month_total - eom_pred["total"]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Predicted remaining at EOM", f"{int(eom_pred['total']):,}")
+    c2.metric("Predicted cured by EOM", f"{int(cured_total):,}", f"{cured_total/this_month_total:.1%}")
+    c3.metric("↳ Normal remaining", f"{int(eom_pred['Normal']):,}")
+    c4.metric("↳ OD remaining", f"{int(eom_pred['OD']):,}")
+
+    # ---- chart: actual (last month) vs predicted (this month) ----
+    st.markdown("#### Remaining debt accounts by checkpoint — last month (actual) vs. this month (predicted)")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=actual_path["checkpoint"], y=actual_path["total"], mode="lines+markers",
+                              name="Actual (last month)", line=dict(color=NAVY, width=2.5)))
+    fig.add_trace(go.Scatter(x=predicted_path["checkpoint"], y=predicted_path["total"], mode="lines+markers",
+                              name="Predicted (this month)", line=dict(color=GOLD, width=2.5, dash="dash")))
+    fig.update_layout(**CHART_TEMPLATE, height=380, yaxis_title="Remaining debt accounts", hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
+    explain("""
+    <b>Actual (last month)</b> is a simulated realized outcome — cure rates applied with
+    month-to-month noise, the way real operations data would look. <b>Predicted (this month)</b>
+    applies the same cure-rate assumptions deterministically to this month's starting volume. The
+    two lines being similar in shape is a sanity check that the assumptions are reasonable; a
+    large gap suggests this month's mix or cure rates should be revisited.
+    """)
+
+    st.markdown("#### Predicted remaining accounts by type, per checkpoint")
+    fig2 = go.Figure()
+    for col, color in [("Normal", NAVY), ("OD", GOLD), ("TDR", GREY)]:
+        fig2.add_trace(go.Scatter(x=predicted_path["checkpoint"], y=predicted_path[col], mode="lines+markers",
+                                   name=col, line=dict(width=2.5, color=color)))
+    fig2.update_layout(**CHART_TEMPLATE, height=360, yaxis_title="Remaining debt accounts")
+    st.plotly_chart(fig2, use_container_width=True)
+    explain("""
+    TDR accounts only have a due date on the 1st, so their line drops once (at Day 1) and then
+    stays flat for the rest of the month — they don't get another chance to cure until next
+    month's cycle. Normal and OD accounts are spread across the 5th/10th/15th/20th, so they
+    deplete in four smaller steps.
+    """)
+
+    with st.expander("Full checkpoint breakdown (predicted, this month)"):
+        st.dataframe(predicted_path.set_index("checkpoint").round(0).astype(int), use_container_width=True)
+
+    # ---- evaluation ----
+    st.markdown("#### Forecast evaluation")
+    bt = backtest_cycle_forecast(tdr_pct, od_pct, cure_rates, prior_month_total, n_sims=300)
+    e1, e2, e3 = st.columns(3)
+    e1.metric("Expected deviation (MAE-like)", f"{bt['mae']:.0f} accounts")
+    e2.metric("RMSE-like", f"{bt['rmse']:.0f} accounts")
+    e3.metric("MAPE-like", f"{bt['mape']:.1f}%")
+    explain(f"""
+    <b>How this was evaluated:</b> this checks the reliability of the <i>method</i>, not this
+    month's specific number. Using last month's starting total ({prior_month_total:,} accounts) as
+    a baseline, 300 alternate versions of "what could have happened" were simulated with the same
+    cure-rate assumptions plus realistic month-to-month noise, then compared against the single
+    deterministic point forecast the method would have produced for that baseline
+    (<b>{bt['point_forecast']:.0f} accounts</b>).<br><br>
+    On average, a realized month-end total differed from the point forecast by about
+    <b>±{bt['mae']:.0f} accounts ({bt['mape']:.1f}%)</b>, with 90% of outcomes falling between
+    <b>{bt['p5']:.0f}</b> and <b>{bt['p95']:.0f}</b>. Apply that same error margin to this month's
+    prediction above (<b>{int(eom_pred['total']):,} accounts</b>) as a rough confidence range,
+    rather than treating it as an exact guarantee, when setting collection targets.
+    """)
 
 st.markdown("---")
 st.caption("All data, forecasts, and models on this page are synthetic and for demonstration. "
