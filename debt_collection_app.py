@@ -510,6 +510,23 @@ with tabs[0]:
     fig.update_layout(**CHART_TEMPLATE, height=420, yaxis_title="Accounts", hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
+    st.markdown("#### Actual vs. predicted — table (this year onward)")
+    current_year = pd.Timestamp.now().year
+    actual_yr = (monthly[monthly["month"].dt.year >= current_year][["month", "accounts"]]
+                 .rename(columns={"accounts": "Actual"}))
+    pred_yr = pd.DataFrame({"month": future_months, "Predicted": pred})
+    table = pd.merge(actual_yr, pred_yr, on="month", how="outer").sort_values("month")
+    table["Month"] = table["month"].dt.strftime("%b %Y")
+    table["Actual"] = table["Actual"].map(lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
+    table["Predicted"] = table["Predicted"].map(lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
+    st.dataframe(table[["Month", "Actual", "Predicted"]].set_index("Month"), use_container_width=True)
+    explain(f"""
+    Rows with only an <b>Actual</b> value are months from {current_year} that have already
+    happened; rows with only a <b>Predicted</b> value are the {horizon} month(s) ahead in the
+    forecast horizon set above. There's no overlap between the two columns since the forecast
+    always starts the month right after the latest actual data point.
+    """)
+
     st.markdown("#### Forecast evaluation")
     bt = backtest_forecast(monthly["accounts"].to_numpy(), holdout=6)
     c1, c2, c3 = st.columns(3)
